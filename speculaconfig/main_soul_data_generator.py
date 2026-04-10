@@ -166,7 +166,7 @@ for i,n_subap in enumerate(n_subaps):
                         f"pyr_im_calibrator.im_tag: '{simpc_tag}', "
                         f"data_store.store_dir:         '{os.path.join(calib_dir,'scratch_simpc')}', "  
                         f"data_store.create_tn: false, "
-                        f"data_store.inputs.input_list: ['s{seeing:1.1f}_{N:1.0f}modes_atmo-atmo_pc_modes.out_modes'], " #,'{N:1.0f}modes_pushpull-pushpull.output'
+                        f"data_store.inputs.input_list: ['s{seeing:1.1f}_{N:1.0f}modes_atmo-atmo_pc_modes.out_modes'], "
                         "}")
             write_yaml_overrides(input_string=overrides)
             try:

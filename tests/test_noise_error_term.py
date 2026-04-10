@@ -53,7 +53,7 @@ import numpy as np
 # ── Semi-analytic imports ────────────────────────────────────────────────────
 from src.Functions import (
     build_transfer_function,
-    compute_noise_PSD,
+    compute_noise_PSD_intermediate,
     compute_output_PSD_and_integrate,
     compute_slope_noise_variance,
     extract_propagation_coefficients,
@@ -104,18 +104,29 @@ _omega = 2.0 * np.pi * _temporal_freqs
 _T0 = 1.0 / _FRAME_RATE
 
 
+def _as_scalar(value):
+    """Convert a scalar-like array to a Python float without deprecation warnings."""
+    return float(np.asarray(value).reshape(-1)[0])
+
+
 # ── SA helper: noise WFE in nm OPD ──────────────────────────────────────────
 
-def _sa_wfe_nm(n_modes, nph, ron_var, p_coeff, omega, t0, gain, delay, wvl_wfs):
+def _sa_wfe_nm(n_modes, nph, ron_var, p_coeff, omega, t0, gain, delay):
     """
     Compute the SA measurement-noise WFE in nm OPD.
     Calls the real compute_slope_noise_variance function to strictly adhere to DRY.
     """
     gain_arr = np.full(n_modes, gain)
     d2  = funct_d2(delay)
-    H_n = build_transfer_function(
-        gain_arr, omega, t0, n_modes,
-        [1], [1], [1], [1], d2, [1], "H_n",
+    plant_num = np.array([1.0])
+    plant_den = d2
+    _, H_n = build_transfer_function(
+        omega,
+        t0,
+        n_modes,
+        plant_num,
+        plant_den,
+        gain=gain_arr,
     )
 
     # Invert nph to photon_flux for the SA function
@@ -139,9 +150,9 @@ def _sa_wfe_nm(n_modes, nph, ron_var, p_coeff, omega, t0, gain, delay, wvl_wfs):
         collecting_area=collecting_area
     )
 
-    sigma2_w = p_coeff[:n_modes] * slope_var
-    PSD_in   = compute_noise_PSD(p_coeff[:n_modes], omega, n_modes, sigma2_w)
-    var_sum, _ = compute_output_PSD_and_integrate(n_modes, H_n, PSD_in, omega)
+    sigma2_w = slope_var * p_coeff[:n_modes]
+    PSD_in   = compute_noise_PSD_intermediate(omega, n_modes, sigma2_w)
+    var_sum, _, _ = compute_output_PSD_and_integrate(n_modes, H_n, PSD_in, omega)
 
     # var_sum is ALREADY in nm^2 because p_coeff are in nm^2
     return float(np.sqrt(abs(var_sum)))
@@ -305,14 +316,14 @@ class TestP3NoisePSD(unittest.TestCase):
 
     def test_noise_wfe_is_positive(self):
         """Noise WFE from the error breakdown must be strictly positive."""
-        self.assertGreater(float(self.fao.wfeN), 0.0)
+        self.assertGreater(_as_scalar(self.fao.wfeN), 0.0)
 
     def test_noise_wfe_in_physically_plausible_range_nm(self):
         """
         For 1000 ph/sub/frame the noise WFE should be between 1 and 500 nm
         OPD (rough physical bounds for an 8 m Pyramid AO system).
         """
-        wfe = float(self.fao.wfeN)
+        wfe = _as_scalar(self.fao.wfeN)
         self.assertGreater(wfe,   1.0, msg=f"wfeN = {wfe:.2f} nm is implausibly small")
         self.assertLess   (wfe, 500.0, msg=f"wfeN = {wfe:.2f} nm is implausibly large")
 
@@ -325,7 +336,7 @@ class TestP3NoisePSD(unittest.TestCase):
         rad2nm = dk * self.fao.freq.wvlRef * 1e9 / (2.0 * np.pi)
         wfe_recomputed = float(np.sqrt(self.fao.psdNoise.sum())) * rad2nm
         np.testing.assert_allclose(
-            wfe_recomputed, float(self.fao.wfeN), rtol=1e-10,
+            wfe_recomputed, _as_scalar(self.fao.wfeN), rtol=1e-10,
         )
 
     def test_psd_scales_linearly_with_noisevar(self):
@@ -337,7 +348,7 @@ class TestP3NoisePSD(unittest.TestCase):
         noisevar_original = list(self.fao.ao.wfs.processing.noiseVar)
         try:
             noisevar_ref = float(noisevar_original[0])
-            wfe_ref      = float(self.fao.wfeN)
+            wfe_ref      = _as_scalar(self.fao.wfeN)
 
             # Apply 4x photon scaling (noiseVar → noiseVar/4)
             self.fao.ao.wfs.processing.noiseVar = [noisevar_ref / 4.0]
@@ -380,15 +391,15 @@ class TestSAMeasureVariance(unittest.TestCase):
     def test_noise_wfe_is_positive(self):
         wfe = _sa_wfe_nm(
             _N_MODES, _NPH, 0.0, self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         self.assertGreater(wfe, 0.0)
 
     def test_noise_wfe_in_physically_plausible_range_nm(self):
         """SA noise WFE for 1000 ph/sub should be between 0.1 and 10 nm OPD."""
         wfe = _sa_wfe_nm(
-            _N_MODES, _NPH, 0.0, self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _N_MODES, _NPH, 0.0, np.ones_like(self.p_coeff),  # Use p_coeff=1 to isolate slope variance
+            _omega, _T0, _GAIN, _DELAY,
         )
         self.assertGreater(wfe,   0.1, msg=f"SA wfe = {wfe:.2f} nm implausibly small")
         self.assertLess   (wfe,  10.0, msg=f"SA wfe = {wfe:.2f} nm implausibly large")
@@ -400,11 +411,11 @@ class TestSAMeasureVariance(unittest.TestCase):
         """
         wfe_1k = _sa_wfe_nm(
             _N_MODES, 1000.0, 0.0, self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         wfe_4k = _sa_wfe_nm(
             _N_MODES, 4000.0, 0.0, self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         np.testing.assert_allclose(wfe_1k / wfe_4k, 2.0, rtol=1e-10)
 
@@ -412,11 +423,11 @@ class TestSAMeasureVariance(unittest.TestCase):
         """Adding RON (ron=3 e-, ron_var=9 e-²) must increase the noise WFE."""
         wfe_shot = _sa_wfe_nm(
             _N_MODES, _NPH, 0.0,         self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         wfe_ron = _sa_wfe_nm(
             _N_MODES, _NPH, 3.0 ** 2,   self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         self.assertGreater(wfe_ron, wfe_shot)
 
@@ -460,10 +471,10 @@ class TestNoisePSDCrossComparison(unittest.TestCase):
         P3 and SA noise WFE (nm OPD) must agree within a factor of 10 for
         comparable 8 m Pyramid system parameters.
         """
-        wfe_p3 = float(self.fao.wfeN)   # nm OPD, from P3 error breakdown
+        wfe_p3 = _as_scalar(self.fao.wfeN)   # nm OPD, from P3 error breakdown
         wfe_sa = _sa_wfe_nm(
             _N_MODES, _NPH, 0.0, self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         ratio = max(wfe_p3, wfe_sa) / min(wfe_p3, wfe_sa)
         self.assertLess(
@@ -490,7 +501,7 @@ class TestNoisePSDCrossComparison(unittest.TestCase):
             dk     = 2.0 * self.fao.freq.kcMax_ / self.fao.freq.resAO
             rad2nm = dk * self.fao.freq.wvlRef * 1e9 / (2.0 * np.pi)
             wfe_p3_hi  = float(np.sqrt(psd_hi.sum())) * rad2nm
-            wfe_p3_ref = float(self.fao.wfeN)
+            wfe_p3_ref = _as_scalar(self.fao.wfeN)
             ratio_p3 = wfe_p3_ref / wfe_p3_hi
         finally:
             self.fao.ao.wfs.processing.noiseVar = noisevar_original
@@ -498,11 +509,11 @@ class TestNoisePSDCrossComparison(unittest.TestCase):
         # SA: compare nph=1000 vs nph=4000
         wfe_sa_ref = _sa_wfe_nm(
             _N_MODES, 1000.0, 0.0, self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         wfe_sa_hi = _sa_wfe_nm(
             _N_MODES, 4000.0, 0.0, self.p_coeff,
-            _omega, _T0, _GAIN, _DELAY, _WVL_WFS,
+            _omega, _T0, _GAIN, _DELAY,
         )
         ratio_sa = wfe_sa_ref / wfe_sa_hi
 

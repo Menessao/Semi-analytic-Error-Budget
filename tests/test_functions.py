@@ -12,17 +12,20 @@ or:
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from scipy import integrate as scipy_integrate
 
 from src.Functions import (
+    DEFAULT_ALIASING_ALPHA,
     _load_andes_gain_grid,
+    aliasing_psd_from_coeffs,
+    build_integrator_controller_polynomials,
     compute_k_prime,
-    compute_noise_PSD,
+    compute_noise_PSD_intermediate,
     compute_slope_noise_variance,
     flux_for_frame_for_pixel,
-    funct_C,
     funct_d2,
     fitting_variance,
     func_out,
@@ -31,6 +34,7 @@ from src.Functions import (
     load_parameters,
     load_PSD_windshake,
     omega_0,
+    PSD_final_alias,
     read_sigma_slopes,
     resize_psd_like,
     total_variance,
@@ -245,36 +249,32 @@ class TestTotalVariance(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# funct_C
+# build_integrator_controller_polynomials
 # ---------------------------------------------------------------------------
 
-class TestFunctC(unittest.TestCase):
-    """funct_C builds the integral controller C = g*Z/(Z-1) in polynomial form."""
+class TestBuildIntegratorControllerPolynomials(unittest.TestCase):
+    """
+    build_integrator_controller_polynomials builds the integral controller
+    C = g*Z/(Z-1) in polynomial form.
+    """
 
     def test_numerator_polynomial_coefficients(self):
         # Numerator of g*Z/(Z-1) is g*Z: polynomial coefficients [g, 0]
         gain = 0.5
-        n4, _, _ = funct_C(gain, np.array([1.0]), t_0=0.001)
-        np.testing.assert_array_almost_equal(np.real(n4), [gain, 0.0], decimal=12)
+        num_int, _ = build_integrator_controller_polynomials(gain)
+        np.testing.assert_array_almost_equal(np.real(num_int), [gain, 0.0], decimal=12)
 
     def test_denominator_polynomial_coefficients(self):
         # Denominator of g*Z/(Z-1) is (Z-1): polynomial coefficients [1, -1]
-        _, d4, _ = funct_C(1.0, np.array([1.0]), t_0=0.001)
-        np.testing.assert_array_almost_equal(np.real(d4), [1.0, -1.0], decimal=12)
-
-    def test_Z_numeric_equals_exp_formula(self):
-        # Z = exp(i * omega * t_0)
-        omega = np.array([0.0, np.pi, 2 * np.pi])
-        t_0 = 0.001
-        _, _, Z = funct_C(1.0, omega, t_0)
-        np.testing.assert_array_almost_equal(Z, np.exp(1j * omega * t_0), decimal=12)
+        _, den_int = build_integrator_controller_polynomials(1.0)
+        np.testing.assert_array_almost_equal(np.real(den_int), [1.0, -1.0], decimal=12)
 
     def test_numerator_scales_with_gain(self):
         # Doubling the gain doubles the leading numerator coefficient
-        n4_1, _, _ = funct_C(1.0, np.array([1.0]), 0.001)
-        n4_2, _, _ = funct_C(2.0, np.array([1.0]), 0.001)
+        num_int_1, _ = build_integrator_controller_polynomials(1.0)
+        num_int_2, _ = build_integrator_controller_polynomials(2.0)
         self.assertAlmostEqual(
-            np.real(n4_2[0]) / np.real(n4_1[0]), 2.0, places=12
+            np.real(num_int_2[0]) / np.real(num_int_1[0]), 2.0, places=12
         )
 
 
@@ -293,40 +293,33 @@ class TestTransferFunct(unittest.TestCase):
     @staticmethod
     def _dc_inputs(gain=0.5):
         """Return polynomial arrays evaluated at DC (omega=0)."""
-        n1 = np.array([1.0])
-        n2 = np.array([1.0])
-        n3 = np.array([1.0])
-        d1 = np.array([1.0])
-        d3 = np.array([1.0])
-        d2 = funct_d2(1)               # delay of 1 frame
+        plant_num = np.array([1.0])   # n1*n2*n3 = 1
+        plant_den = funct_d2(1)        # d1*d2*d3 = delay polynomial
         omega_dc = np.array([0.0])
-        n4, d4, Z = funct_C(gain, omega_dc, t_0=0.001)
-        return n1, n2, n3, n4, d1, d2, d3, d4, Z
+        num_int, den_int = build_integrator_controller_polynomials(gain)
+        Z = np.exp(1j * omega_dc * 0.001)
+        return plant_num, num_int, plant_den, den_int, Z
 
     def test_H_n_equals_one_at_DC(self):
         # Integral control has unity DC gain on the noise path
-        n1, n2, n3, n4, d1, d2, d3, d4, Z = self._dc_inputs(gain=0.5)
-        H_n = transfer_funct(n1, n2, n3, n4, d1, d2, d3, d4, Z, "H_n")
+        plant_num, num_int, plant_den, den_int, Z = self._dc_inputs(gain=0.5)
+        _, H_n = transfer_funct(plant_num, num_int, plant_den, den_int, Z)
         self.assertAlmostEqual(abs(H_n[0]), 1.0, places=6)
 
     def test_H_r_equals_zero_at_DC(self):
         # Integral control perfectly rejects a DC disturbance
-        n1, n2, n3, n4, d1, d2, d3, d4, Z = self._dc_inputs(gain=0.5)
-        H_r = transfer_funct(n1, n2, n3, n4, d1, d2, d3, d4, Z, "H_r")
+        plant_num, num_int, plant_den, den_int, Z = self._dc_inputs(gain=0.5)
+        H_r, _ = transfer_funct(plant_num, num_int, plant_den, den_int, Z)
         self.assertAlmostEqual(abs(H_r[0]), 0.0, places=6)
-
-    def test_invalid_type_raises_ValueError(self):
-        n1, n2, n3, n4, d1, d2, d3, d4, Z = self._dc_inputs()
-        with self.assertRaises(ValueError):
-            transfer_funct(n1, n2, n3, n4, d1, d2, d3, d4, Z, "bad_type")
 
     def test_output_length_matches_frequency_vector(self):
         n_freq = 50
         omega = np.linspace(0.01, 100.0, n_freq)
-        n4, d4, Z = funct_C(0.3, omega, 0.001)
-        n1 = n2 = n3 = d1 = d3 = np.array([1.0])
-        d2 = funct_d2(1)
-        H_r = transfer_funct(n1, n2, n3, n4, d1, d2, d3, d4, Z, "H_r")
+        num_int, den_int = build_integrator_controller_polynomials(0.3)
+        Z = np.exp(1j * omega * 0.001)
+        plant_num = np.array([1.0])
+        plant_den = funct_d2(1)
+        H_r, _ = transfer_funct(plant_num, num_int, plant_den, den_int, Z)
         self.assertEqual(len(H_r), n_freq)
 
 
@@ -366,7 +359,7 @@ class TestComputeNoisePSD(unittest.TestCase):
         omega     = np.linspace(1.0, 10.0, 200)
         bandwidth = 10.0 - 1.0
         sigma2_w  = np.array([1.0, 4.0])
-        PSD_w     = compute_noise_PSD(np.ones(2), omega, 2, sigma2_w)
+        PSD_w     = compute_noise_PSD_intermediate(omega, 2, sigma2_w)
         for i, s2 in enumerate(sigma2_w):
             np.testing.assert_array_almost_equal(
                 PSD_w[i, :], np.full(200, s2 / bandwidth)
@@ -374,14 +367,14 @@ class TestComputeNoisePSD(unittest.TestCase):
 
     def test_output_shape(self):
         omega    = np.linspace(1.0, 10.0, 50)
-        PSD_w    = compute_noise_PSD(np.ones(3), omega, 3, np.ones(3))
+        PSD_w    = compute_noise_PSD_intermediate(omega, 3, np.ones(3))
         self.assertEqual(PSD_w.shape, (3, 50))
 
     def test_integral_recovers_variance(self):
         # ∫ PSD_w dω over the bandwidth must equal sigma2_w
         omega    = np.linspace(1.0, 10.0, 100001)
         sigma2_w = np.array([3.0])
-        PSD_w    = compute_noise_PSD(np.ones(1), omega, 1, sigma2_w)
+        PSD_w    = compute_noise_PSD_intermediate(omega, 1, sigma2_w)
         recovered = scipy_integrate.simpson(PSD_w[0, :], omega)
         self.assertAlmostEqual(recovered, sigma2_w[0], places=4)
 
@@ -470,19 +463,86 @@ class TestComputeKPrime(unittest.TestCase):
         )
         return sigma_slope ** 2 / (c ** 2 * integral)
 
+
+class TestAliasingDefaultsAndOpticalGain(unittest.TestCase):
+    """Regression tests for aliasing defaults and optical-gain broadcasting."""
+
+    @staticmethod
+    def _formula(omega, alpha, sigma_slope, c, D, v, N):
+        w0      = 2 * np.pi * (N + 1) * v / D
+        om_min  = np.min(omega)
+        om_max  = np.max(omega)
+        integral = (
+            w0 ** alpha * (w0 - om_min)
+            + (om_max ** (alpha + 1) - w0 ** (alpha + 1)) / (alpha + 1)
+        )
+        return sigma_slope ** 2 / (c ** 2 * integral)
+
+    @patch("src.Functions.k_coeff_aliasing", return_value=np.array([1.0]))
+    def test_psd_final_alias_defaults_alpha_to_minus_17_over_3(self, mock_k):
+        omega = np.array([1.0, 2.0, 4.0])
+
+        PSD_final_alias(
+            c_optg=2.0,
+            actuators_number=1,
+            omega_temp_freq_interval=omega,
+            telescope_diameter=8.0,
+            seeing=0.8,
+            modulation_radius=3.0,
+            windspeed=10.0,
+            maximum_radial_order_corrected=5,
+            file_path_matrix_R="dummy.fits",
+        )
+
+        self.assertEqual(mock_k.call_args.kwargs["alpha"], DEFAULT_ALIASING_ALPHA)
+
+    @patch("src.Functions.k_coeff_aliasing", return_value=np.array([1.0, 4.0]))
+    def test_psd_final_alias_accepts_row_vector_optical_gain(self, mock_k):
+        omega = np.array([1.0, 2.0, 4.0])
+        c_optg = np.array([[2.0, 4.0, 8.0, 16.0]])
+
+        result = PSD_final_alias(
+            c_optg=c_optg,
+            actuators_number=2,
+            omega_temp_freq_interval=omega,
+            telescope_diameter=8.0,
+            seeing=0.8,
+            modulation_radius=3.0,
+            windspeed=10.0,
+            maximum_radial_order_corrected=5,
+            file_path_matrix_R="dummy.fits",
+            alpha=-1.0,
+        )
+
+        expected = aliasing_psd_from_coeffs(
+            2,
+            omega,
+            np.array([1.0, 4.0]),
+            alpha=-1.0,
+            telescope_diameter=8.0,
+            windspeed=10.0,
+            maximum_radial_order_corrected=5,
+        ) / np.array([[2.0], [4.0]]) ** 2
+
+        np.testing.assert_allclose(result, expected)
+        mock_k.assert_called_once()
+
     def test_matches_analytical_formula(self):
         omega = np.logspace(0, 3, 500)   # 1 … 1000 rad/s
         alpha, sigma, c = -17 / 3, 0.01, 0.8
         D, v, N = 38.5, 8.0, 88
         expected = self._formula(omega, alpha, sigma, c, D, v, N)
         self.assertAlmostEqual(
-            compute_k_prime(omega, alpha, sigma, c, D, v, N), expected, places=10
+            compute_k_prime(omega, sigma, D, v, N, alpha=alpha) / c**2,
+            expected,
+            places=10,
         )
 
     def test_result_is_positive(self):
         omega = np.logspace(0, 3, 200)
         self.assertGreater(
-            compute_k_prime(omega, -17 / 3, 0.01, 0.8, 38.5, 8.0, 88), 0
+            compute_k_prime(omega, 0.01, 38.5, 8.0, 88, alpha=-17 / 3),
+            0,
         )
 
 
@@ -528,12 +588,12 @@ class _ChdirMixin:
 class TestBuildOpticalGainGrid(_ChdirMixin, unittest.TestCase):
     """_load_andes_gain_grid assembles a 2×N array from ANDES FITS files."""
 
-    def test_output_is_2d_ndarray(self):
+    def test_output_is_3d_ndarray(self):
         file_mod0 = "src/file_fits/ANDES/ANDES_og_mod0.fits"
         file_mod4 = "src/file_fits/ANDES/ANDES_og_mod4.fits"
         grid = _load_andes_gain_grid(file_mod0, file_mod4)
         self.assertIsInstance(grid, np.ndarray)
-        self.assertEqual(grid.ndim, 2)
+        self.assertEqual(grid.ndim, 3)
 
     def test_two_rows_one_per_modulation_radius(self):
         # One row for mod0, one for mod4
